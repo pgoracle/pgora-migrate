@@ -1,0 +1,387 @@
+#!/usr/bin/perl
+#------------------------------------------------------------------------------
+# Project  : Oracle to Postgresql converter
+# Name     : ora2pg
+# Author   : Gilles Darold, gilles _AT_ darold _DOT_ net
+# Copyright: Copyright (c) 2000-2014 : Gilles Darold - All rights reserved -
+# Function : Script used to convert Oracle Database to PostgreSQL
+# Usage    : ora2pg configuration_file
+#------------------------------------------------------------------------------
+#
+#        This program is free software: you can redistribute it and/or modify
+#        it under the terms of the GNU General Public License as published by
+#        the Free Software Foundation, either version 3 of the License, or
+#        any later version.
+# 
+#        This program is distributed in the hope that it will be useful,
+#        but WITHOUT ANY WARRANTY; without even the implied warranty of
+#        MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#        GNU General Public License for more details.
+# 
+#        You should have received a copy of the GNU General Public License
+#        along with this program. If not, see < http://www.gnu.org/licenses/ >.
+# 
+#------------------------------------------------------------------------------
+use strict qw/vars/;
+
+use Ora2Pg;
+use Getopt::Long qw(:config no_ignore_case bundling);
+use POSIX qw(locale_h sys_wait_h _exit);
+setlocale(LC_NUMERIC, '');
+setlocale(LC_ALL,     'C');
+
+my $VERSION = '13.0';
+
+$| = 1;
+
+my $CONFIG_FILE = '/etc/ora2pg/ora2pg.conf';
+my $DEBUG = 0;
+my $QUIET = 0;
+my $HELP = 0;
+my $LOGFILE = '';
+my $EXPORT_TYPE = '';
+my $OUTFILE = '';
+my $OUTDIR = '';
+my $SHOW_VER = 0;
+my $PLSQL = 0;
+my $DSN = '';
+my $DBUSER = '';
+my $DBPWD = '';
+my $SCHEMA = '';
+my $TABLEONLY = '';
+my $FORCEOWNER = '';
+my $ORA_ENCODING = '';
+my $PG_ENCODING = '';
+my $INPUT_FILE = '';
+my $EXCLUDE = '';
+my $ALLOW = '';
+my $VIEW_AS_TABLE = '';
+my $ESTIMATE_COST = 0;
+my $COST_UNIT_VALUE = 0;
+my $DUMP_AS_HTML = 0;
+my $THREAD_COUNT = 0;
+my $ORACLE_COPIES = 0;
+my $PARALLEL_TABLES = 0;
+my $DATA_LIMIT = 0;
+my $CREATE_PROJECT = '';
+my $PROJECT_BASE = '.';
+
+my @SCHEMA_ARRAY  = qw( TABLE PACKAGE VIEW GRANT SEQUENCE TRIGGER FUNCTION PROCEDURE TABLESPACE PARTITION TYPE MVIEW );
+my @EXTERNAL_ARRAY  = qw( KETTLE FDW );
+my @REPORT_ARRAY  = qw( SHOW_VERSION SHOW_REPORT SHOW_SCHEMA SHOW_TABLE SHOW_COLUMN SHOW_ENCODING  );
+my @SOURCES_ARRAY = qw( PACKAGE VIEW TRIGGER FUNCTION PROCEDURE PARTITION TYPE MVIEW );
+my @DATA_ARRAY    = qw( INSERT COPY );
+my @CAPABILITIES  = qw( QUERY);
+push(@CAPABILITIES, @SCHEMA_ARRAY, @REPORT_ARRAY, @DATA_ARRAY, @EXTERNAL_ARRAY);
+
+# Collect command line arguments
+GetOptions (
+	'a|allow=s' => \$ALLOW,
+        'b|basedir=s' => \$OUTDIR,
+        'c|conf=s' => \$CONFIG_FILE,
+        'd|debug!' => \$DEBUG,
+	'e|exclude=s' => \$EXCLUDE,
+        'h|help!' => \$HELP,
+	'i|input_file=s' => \$INPUT_FILE,
+	'j|jobs=i' => \$THREAD_COUNT,
+	'J|copies=i' => \$ORACLE_COPIES,
+        'l|log=s' => \$LOGFILE,
+	'L|limit=i' => \$DATA_LIMIT,
+        'o|out=s' => \$OUTFILE,
+	'p|plsql!' => \$PLSQL,
+	'P|parallel=i' =>\$PARALLEL_TABLES,
+	'q|quiet!' => \$QUIET,
+        't|type=s' => \$EXPORT_TYPE,
+	'v|version!' => \$SHOW_VER,
+	's|source=s' => \$DSN,
+	'u|user=s' => \$DBUSER,
+	'w|password=s' => \$DBPWD,
+	'n|namespace=s' => \$SCHEMA,
+	'x|xtable=s' => \$TABLEONLY, # Obsolete
+	'forceowner=s' => \$FORCEOWNER,
+	'nls_lang=s' => \$ORA_ENCODING,
+	'client_encoding=s' => \$PG_ENCODING,
+	'view_as_table=s' => \$VIEW_AS_TABLE,
+	'estimate_cost!' =>\$ESTIMATE_COST,
+	'cost_unit_value=i' =>\$COST_UNIT_VALUE,
+	'dump_as_html!' =>\$DUMP_AS_HTML,
+	'init_project=s' => \$CREATE_PROJECT,
+	'project_base=s' => \$PROJECT_BASE,
+);
+
+# Check command line parameters
+if ($SHOW_VER) {
+	print "Ora2Pg v$VERSION\n";
+	exit 0;
+}
+if ($HELP) {
+	&usage();
+}
+
+# Create project repository and useful stuff
+if ($CREATE_PROJECT) {
+	if (!-d "$PROJECT_BASE") {
+		print "FATAL: Project base directory does not exists: $PROJECT_BASE\n";
+		&usage();
+	}
+	print STDERR "Creating project $CREATE_PROJECT.\n";
+	&create_project($CREATE_PROJECT, $PROJECT_BASE);
+	exit 0;
+}
+
+# Check configuration file
+if (! -e $CONFIG_FILE) {
+	print "FATAL: can't find configuration file $CONFIG_FILE\n";
+	&usage();
+}
+
+# Validate export type
+$EXPORT_TYPE = uc($EXPORT_TYPE);
+$EXPORT_TYPE =~ s/DATA/INSERT/;
+foreach my $t (split(/[,;\s\t]+/, $EXPORT_TYPE)) {
+	if ($t && !grep(/^$t$/, @CAPABILITIES)) {
+		print "FATAL: Unknow export type: $t. Type supported: ", join(',', @CAPABILITIES), "\n";
+		&usage();
+	}
+}
+
+# Preserve barckward compatibility
+if ($TABLEONLY) {
+	warn "-x | --xtable is deprecated, use -a | --allow option instead.\n";
+	if (!$ALLOW) {
+		$ALLOW = $TABLEONLY;
+	}
+}
+
+sub getout
+{
+        my $sig = shift;
+        print STDERR "Received terminating signal ($sig).\n";
+        $SIG{INT} = \&getout;
+        $SIG{TERM} = \&getout;
+	exit 1;
+}
+$SIG{INT} = \&getout;
+$SIG{TERM} = \&getout;
+
+# Create an instance of the Ora2Pg perl module
+my $schema = new Ora2Pg (
+	config => $CONFIG_FILE,
+	type   => $EXPORT_TYPE,
+	debug  => $DEBUG,
+	logfile=> $LOGFILE,
+	output => $OUTFILE,
+	output_dir => $OUTDIR,
+	plsql_pgsql => $PLSQL,
+	datasource => $DSN,
+	user => $DBUSER,
+	password => $DBPWD,
+	schema => $SCHEMA,
+	force_owner => $FORCEOWNER,
+        nls_lang => $ORA_ENCODING,
+        client_encoding => $PG_ENCODING,
+        input_file => $INPUT_FILE,
+	quiet => $QUIET,
+	exclude => $EXCLUDE,
+	allow => $ALLOW,
+	view_as_table => $VIEW_AS_TABLE,
+	estimate_cost => $ESTIMATE_COST,
+	cost_unit_value => $COST_UNIT_VALUE,
+	dump_as_html => $DUMP_AS_HTML,
+	thread_count => $THREAD_COUNT,
+	oracle_copies => $ORACLE_COPIES,
+	data_limit => $DATA_LIMIT,
+	parallel_tables => $PARALLEL_TABLES,
+);
+
+
+# Proceed to Oracle DB extraction following
+# configuration file definitions.
+if ( ($EXPORT_TYPE !~ /^SHOW_/i) && !$INPUT_FILE ) {
+	$schema->export_schema();
+}
+
+exit(0);
+
+####
+# Show usage
+####
+sub usage
+{
+	print qq{
+Usage: ora2pg [-dhpqv --estimate_cost --dump_as_html] [--option value]
+
+    -a | --allow str  : coma separated list of objects to allow from export.
+			Can be used with SHOW_COLUMN too.
+    -b | --basedir dir: Used to set the default output directory, where files
+			resulting from exports will be stored.
+    -c | --conf file  : Used to set an alternate configuration file than the
+			default /etc/ora2pg/ora2pg.conf.
+    -d | --debug      : Enable verbose output.
+    -e | --exclude str: coma separated list of objects to exclude from export.
+			Can be used with SHOW_COLUMN too.
+    -h | --help       : Print this short help.
+    -i | --input file : File containing Oracle PL/SQL code to convert with
+			no Oracle database connection initiated.
+    -j | --jobs num   : number of parallel process to send data to PostgreSQL.
+    -J | --copies num : number of parallel connection to extract data from Oracle.
+    -l | --log file   : Used to set a log file. Default is stdout.
+    -L | --limit num  : number of tuples extracted from Oracle and stored in
+			memory before writing, default: 10000.
+    -n | --namespace schema : Used to set the Oracle schema to extract from.
+    -o | --out file   : Used to set the path to the output file where SQL will
+			be written. Default: output.sql in running directory.
+    -p | --plsql      : Enable PLSQL to PLPSQL code conversion.
+    -P | --parallel num: Number of parallel tables to extract at the same time.
+    -q | --quiet      : disable progress bar.
+    -s | --source DSN : Allow to set the Oracle DBI datasource.
+    -t | --type export: Used to set the export type. It will override the one
+			given in the configuration file (TYPE).
+    -u | --user name  : Used to set the Oracle database connection user.
+    -v | --version    : Show Ora2Pg Version and exit.
+    -w | --password pwd : Used to set the password of the Oracle database user.
+    --forceowner: if set to 1 force ora2pg to set tables and sequences owner
+		  like in Oracle database. If the value is set to a username this
+		  one will be used as the objects owner. By default it's the user
+		  used to connect to the Pg database that will be the owner.
+    --nls_lang code: use this to set the Oracle NLS_LANG client encoding.
+    --client_encoding code: Use this to set the PostgreSQL client encoding.
+    --view_as_table str: coma separated list of view to export as table.
+    --estimate_cost   : activate the migration cost evalution with SHOW_REPORT
+    --cost_unit_value minutes: number of minutes for a cost evalution unit.
+		  default: 5 minutes, correspond to a migration conducted by a
+		  PostgreSQL expert. Set it to 10 if this is your first migration.
+   --dump_as_html     : force ora2pg to dump report in HTML, used only with
+                        SHOW_REPORT. Default is to dump report as simple text.
+   --init_project NAME: initialise a typical ora2pg project tree. Top directory
+                        will be created under project base dir.
+   --project_base DIR : define the base dir for ora2pg project trees. Default
+                        is current directory.
+
+See full documentation at http://ora2pg.darold.net/ for more help or see
+manpage with 'man ora2pg'.
+
+};
+	exit 0;
+
+	'init_project=s' => \$CREATE_PROJECT,
+	'project_base=s' => \$PROJECT_BASE,
+}
+
+####
+# Create a generic project tree
+####
+sub create_project
+{
+	my ($create_project, $project_base) = @_;
+
+	# Build entire project tree
+	my $base_path = $project_base . '/' . $create_project;
+	die "FATAL: project directory exists $base_path\n" if (-e $base_path);
+	mkdir("$base_path");
+	print "$base_path/\n";
+	mkdir("$base_path/schema");
+	print "\tschema/\n";
+
+	foreach my $exp (sort @SCHEMA_ARRAY ) {
+		mkdir("$base_path/schema/" . lc($exp) . 's');
+		print "\t\t" . lc($exp) . "s/\n";
+	}
+	mkdir("$base_path/sources");
+	print "\tsources/\n";
+	foreach my $exp (sort @SOURCES_ARRAY ) {
+		mkdir("$base_path/sources/" . lc($exp) . 's');
+		print "\t\t" . lc($exp) . "s/\n";
+	}
+	mkdir("$base_path/data");
+	print "\tdata/\n";
+	mkdir("$base_path/config");
+	print "\tconfig/\n";
+	mkdir("$base_path/reports");
+	print "\treports/\n";
+	print "\n";
+
+	# Copy configuration file and transform it as a generic one
+	print "Generating generic configuration file\n";
+	my $conf_file = '/etc/ora2pg/ora2pg.conf.dist';
+	if (open(IN, "$conf_file")) {
+		my @cf = <IN>;
+		close(IN);
+		&make_config_generic(\@cf);
+		open(OUT, ">$base_path/config/ora2pg.conf") or die "FATAL: can't write to file $base_path/config/ora2pg.conf\n";
+		print OUT @cf;
+		close(OUT);
+	} else {
+		print "ERROR: file $CONFIG_FILE does not exists.\n";
+	}
+
+	# Generate shell script to execute all export
+	print "Creating script export_schema.sh to automate all exports.\n";
+	open(OUT, "> $base_path/export_schema.sh") or die "FATAL: Can't write to file $base_path/export_schema.sh\n";
+	print OUT qq{#!/bin/sh
+#-------------------------------------------------------------------------------
+#
+# Generated by Ora2Pg, the Oracle database Schema converter, version $VERSION
+#
+#-------------------------------------------------------------------------------
+};
+	print OUT "EXPORT_TYPE=\"", join(' ', @SCHEMA_ARRAY), "\"\n";
+	print OUT "SOURCE_TYPE=\"", join(' ', @SOURCES_ARRAY), "\"\n";
+	print OUT "namespace=\".\"\n";
+	print OUT qq{
+ora2pg -t SHOW_TABLE -c \$namespace/config/ora2pg.conf > \$namespace/reports/tables.txt
+ora2pg -t SHOW_COLUMN -c \$namespace/config/ora2pg.conf > \$namespace/reports/columns.txt
+ora2pg -t SHOW_REPORT -c \$namespace/config/ora2pg.conf --dump_as_html --estimate_cost > \$namespace/reports/report.html
+
+for etype in \$(echo \$EXPORT_TYPE | tr " " "\\n")
+do
+        ltype=`echo \$etype | tr '[:upper:]' '[:lower:]'`
+        echo "Running: ora2pg -p -t \$etype -o \$ltype.sql -b \$namespace/schema/\$\{ltype\}s -c \$namespace/config/ora2pg.conf"
+        ora2pg -p -t \$etype -o \$ltype.sql -b \$namespace/schema/\$\{ltype\}s -c \$namespace/config/ora2pg.conf
+done
+
+for etype in \$(echo \$SOURCE_TYPE | tr " " "\\n")
+do
+        ltype=`echo \$etype | tr '[:upper:]' '[:lower:]'`
+        echo "Running: ora2pg -t \$etype -o \$ltype.sql -b \$namespace/sources/\$\{ltype\}s -c \$namespace/config/ora2pg.conf"
+        ora2pg -t \$etype -o \$ltype.sql -b \$namespace/sources/\$\{ltype\}s -c \$namespace/config/ora2pg.conf
+done
+
+echo
+echo
+echo "To extract data use the following command:"
+echo
+echo "ora2pg -t COPY -o data.sql -b \$namespace/data -c \$namespace/config/ora2pg.conf"
+echo
+
+exit 0
+};
+}
+
+####
+# Set a generic configuration
+####
+sub make_config_generic
+{
+	my $conf_arr = shift;
+
+	chomp(@$conf_arr);
+
+	for (my $i = 0; $i <= $#{$conf_arr}; $i++) {
+		$conf_arr->[$i] =~ s/^USER_GRANTS.*0/USER_GRANTS\t1/;
+		$conf_arr->[$i] =~ s/^#SCHEMA.*SCHEMA_NAME/SCHEMA\tCHANGE_THIS_SCHEMA_NAME/;
+		$conf_arr->[$i] =~ s/^#(NLS_LANG.*AMERICAN_AMERICA.UTF8)/$1/;
+		$conf_arr->[$i] =~ s/^#(BINMODE.*utf8)/$1/;
+		$conf_arr->[$i] =~ s/^PLSQL_PGSQL.*1/PLSQL_PGSQL\t0/;
+		$conf_arr->[$i] =~ s/^FILE_PER_CONSTRAINT.*0/FILE_PER_CONSTRAINT\t1/;
+		$conf_arr->[$i] =~ s/^FILE_PER_INDEX.*0/FILE_PER_INDEX\t1/;
+		$conf_arr->[$i] =~ s/^FILE_PER_TABLE.*0/FILE_PER_TABLE\t1/;
+		$conf_arr->[$i] =~ s/^FILE_PER_FUNCTION.*0/FILE_PER_FUNCTION\t1/;
+		$conf_arr->[$i] =~ s/^TRUNCATE_TABLE.*0/TRUNCATE_TABLE\t1/;
+		$conf_arr->[$i] =~ s/^#CLIENT_ENCODING.*LATIN9/CLIENT_ENCODING\tUTF8/;
+		$conf_arr->[$i] =~ s/^#LONGREADLEN.*1047552/LONGREADLEN\t5000000/;
+		$conf_arr->[$i] =~ s/^AUTODETECT_SPATIAL_TYPE.*0/AUTODETECT_SPATIAL_TYPE\t1/;
+		$conf_arr->[$i] =~ s/^NULL_EQUAL_EMPTY.*1/NULL_EQUAL_EMPTY\t0/;
+	}
+	map { s/$/\n/; } @$conf_arr;
+}
